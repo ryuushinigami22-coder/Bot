@@ -1,0 +1,133 @@
+name: Android Release Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_id:
+        description: "Unique builder job id"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show project layout
+        shell: bash
+        run: |
+          set +e
+          echo "=== ROOT ==="
+          ls -la
+          echo "=== ANDROID ==="
+          [ -d android ] && find android -maxdepth 2 -type f | sort | head -200 || true
+          echo "=== FLUTTER ==="
+          [ -f pubspec.yaml ] && echo "Flutter project detected" || true
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: gradle
+
+      - name: Set up Flutter
+        if: ${{ hashFiles('pubspec.yaml') != '' }}
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Build Flutter APK
+        if: ${{ hashFiles('pubspec.yaml') != '' }}
+        shell: bash
+        run: |
+          set -o pipefail
+          flutter --version
+          flutter pub get 2>&1 | tee flutter-pub-get.log
+          flutter build apk --release --verbose 2>&1 | tee flutter-build.log
+
+      - name: Build native Android APK
+        if: ${{ hashFiles('pubspec.yaml') == '' && hashFiles('android/gradlew') != '' }}
+        working-directory: android
+        shell: bash
+        run: |
+          set -o pipefail
+          chmod +x gradlew
+          ./gradlew assembleRelease --no-daemon --stacktrace --info 2>&1 | tee ../gradle-full.log
+
+      - name: Build root Gradle Android APK
+        if: ${{ hashFiles('pubspec.yaml') == '' && hashFiles('android/gradlew') == '' && hashFiles('gradlew') != '' }}
+        shell: bash
+        run: |
+          set -o pipefail
+          chmod +x gradlew
+          ./gradlew assembleRelease --no-daemon --stacktrace --info 2>&1 | tee gradle-full.log
+
+      - name: Verify APK
+        shell: bash
+        run: |
+          set +e
+          echo "=== APK FILES ==="
+          find . -type f -name "*.apk" -print
+          APK_COUNT=$(find . -type f -name "*.apk" | wc -l)
+          if [ "$APK_COUNT" -eq 0 ]; then
+            echo "::error::No APK was produced."
+            echo "=== POSSIBLE ERROR LINES ==="
+            grep -RniE "FAILURE:|ERROR:|e: |What went wrong:|Execution failed|Compilation error" . --include='*.log' 2>/dev/null | tail -300 || true
+            exit 1
+          fi
+
+      - name: Collect logs
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "BUILD_ID=${{ inputs.build_id }}"
+            echo
+            echo "=== Gradle / Flutter logs ==="
+            for f in gradle-full.log flutter-build.log flutter-pub-get.log; do
+              if [ -f "$f" ]; then
+                echo "===== $f ====="
+                cat "$f"
+              fi
+            done
+            if [ -d android ]; then
+              find android -type f \( -name "*.log" -o -name "*.txt" \) -size -2M -print0 2>/dev/null |
+              while IFS= read -r -d '' f; do
+                echo "===== $f ====="
+                cat "$f"
+              done
+            fi
+          } > builder-full.log 2>&1
+
+      - name: Upload APK
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-release-apk
+          path: |
+            **/*.apk
+          if-no-files-found: error
+          retention-days: 3
+
+      - name: Upload full logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs-${{ inputs.build_id }}
+          path: |
+            builder-full.log
+            gradle-full.log
+            flutter-build.log
+            flutter-pub-get.log
+          if-no-files-found: warn
+          retention-days: 3
