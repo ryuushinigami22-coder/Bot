@@ -24,87 +24,219 @@ permissions:
   contents: read
   actions: write
 
+env:
+  GRADLE_OPTS: "-Dorg.gradle.daemon=false -Dorg.gradle.jvmargs=-Xmx4g -Dfile.encoding=UTF-8"
+  PUB_CACHE: "${{ github.workspace }}/.pub-cache"
+
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
-    env:
-      GRADLE_OPTS: "-Dorg.gradle.daemon=false -Dorg.gradle.jvmargs=-Xmx4g -Dfile.encoding=UTF-8"
-      PUB_CACHE: "${{ github.workspace }}/.pub-cache"
+    timeout-minutes: 60
 
     steps:
-      - name: Setup Java 17
-        uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: "17"
-          cache: gradle
-
       - name: Download project ZIP
         shell: bash
         run: |
           set -Eeuo pipefail
-          rm -rf project_raw project.zip
+          rm -rf project_raw project.zip build-output build-logs
+          mkdir -p project_raw build-output build-logs
+
           curl --fail --location --retry 5 --retry-all-errors \
             -H "Authorization: Bearer ${{ secrets.GH_TOKEN }}" \
             -H "Accept: application/octet-stream" \
             "${{ github.event.inputs.zip_url }}" -o project.zip
+
           test -s project.zip
           unzip -t project.zip >/dev/null
           unzip -q project.zip -d project_raw
           echo "ZIP_SIZE=$(du -h project.zip | cut -f1)"
 
-      - name: Detect project type and root
+      - name: Detect project and toolchain
         id: detect
         shell: bash
         run: |
           set -Eeuo pipefail
-          ROOT="$(pwd)/project_raw"
 
-          # Handle ZIPs that contain one top-level project directory.
+          ROOT="$(pwd)/project_raw"
           mapfile -t dirs < <(find "$ROOT" -mindepth 1 -maxdepth 1 -type d -print)
           mapfile -t files < <(find "$ROOT" -mindepth 1 -maxdepth 1 -type f -print)
           if [ "${#dirs[@]}" -eq 1 ] && [ "${#files[@]}" -eq 0 ]; then
             ROOT="${dirs[0]}"
           fi
 
-          FLUTTER="false"
-          NATIVE="false"
+          FLUTTER=false
+          NATIVE=false
           if [ -f "$ROOT/pubspec.yaml" ]; then
-            FLUTTER="true"
-          elif [ -f "$ROOT/gradlew" ] || [ -f "$ROOT/settings.gradle" ] || [ -f "$ROOT/settings.gradle.kts" ] || [ -f "$ROOT/build.gradle" ] || [ -f "$ROOT/build.gradle.kts" ]; then
-            NATIVE="true"
+            FLUTTER=true
+          fi
+          if [ -f "$ROOT/gradlew" ] || [ -f "$ROOT/settings.gradle" ] || [ -f "$ROOT/settings.gradle.kts" ] || [ -f "$ROOT/build.gradle" ] || [ -f "$ROOT/build.gradle.kts" ]; then
+            NATIVE=true
           fi
 
-          if [ "$FLUTTER" = "false" ] && [ "$NATIVE" = "false" ]; then
-            echo "ERROR: ZIP bukan project Flutter/Android yang dikenali."
-            find "$ROOT" -maxdepth 2 -type f | sort | head -200
+          FLUTTER_EXACT=false
+          if [ "$FLUTTER" = true ] && grep -Eq '^[[:space:]]+flutter:[[:space:]]*[0-9]+\.[0-9]+\.[0-9]+([[:space:]]|$)' "$ROOT/pubspec.yaml" 2>/dev/null; then
+            FLUTTER_EXACT=true
+          fi
+
+          if [ "$FLUTTER" = false ] && [ "$NATIVE" = false ]; then
+            echo "ERROR: project bukan Flutter/Android Native."
+            find "$ROOT" -maxdepth 3 -type f | sort | head -250
             exit 1
           fi
 
-          echo "PROJECT_DIR=$ROOT" >> "$GITHUB_ENV"
+          # Find AGP in both Groovy and Kotlin DSL. Prefer the first explicit version.
+          AGP=""
+          while IFS= read -r f; do
+            v=$(grep -Eo 'com\.android\.tools\.build:gradle:[0-9]+(\.[0-9]+){1,3}' "$f" 2>/dev/null | head -1 | sed 's/.*:gradle://' || true)
+            if [ -n "$v" ]; then AGP="$v"; break; fi
+            v=$(grep -Eo 'id[[:space:]]*\(?["'"']com\.android\.application["'"']\)?[[:space:]]*version[[:space:]]*["'"'][0-9]+(\.[0-9]+){1,3}["'"']' "$f" 2>/dev/null | head -1 | grep -Eo '[0-9]+(\.[0-9]+){1,3}' | tail -1 || true)
+            if [ -n "$v" ]; then AGP="$v"; break; fi
+          done < <(find "$ROOT" -maxdepth 3 -type f \( -name '*.gradle' -o -name '*.gradle.kts' \) | sort)
+
+          GRADLE=""
+          if [ -f "$ROOT/gradle/wrapper/gradle-wrapper.properties" ]; then
+            GRADLE=$(grep -Eo 'gradle-[0-9]+(\.[0-9]+){1,2}-(bin|all)\.zip' "$ROOT/gradle/wrapper/gradle-wrapper.properties" | head -1 | sed -E 's/gradle-([0-9.]+)-(bin|all)\.zip/\1/' || true)
+          fi
+
+          # JDK policy: AGP 8+ => 17, AGP 7.x => 11, older AGP => 8.
+          # If AGP cannot be read, 17 is the safest modern default and the real
+          # compatibility check below reports the exact mismatch instead of hiding it.
+          JAVA=17
+          if [ -n "$AGP" ]; then
+            AGP_MAJOR="${AGP%%.*}"
+            if [ "$AGP_MAJOR" -ge 8 ]; then JAVA=17; fi
+            if [ "$AGP_MAJOR" -eq 7 ]; then JAVA=11; fi
+            if [ "$AGP_MAJOR" -le 4 ]; then JAVA=8; fi
+          fi
+
+          echo "project_dir=$ROOT" >> "$GITHUB_OUTPUT"
           echo "flutter=$FLUTTER" >> "$GITHUB_OUTPUT"
           echo "native=$NATIVE" >> "$GITHUB_OUTPUT"
-          echo "project_dir=$ROOT" >> "$GITHUB_OUTPUT"
-          echo "=== PROJECT DETECTION ==="
-          echo "ROOT=$ROOT"
-          echo "FLUTTER=$FLUTTER"
-          echo "NATIVE=$NATIVE"
+          echo "flutter_exact=$FLUTTER_EXACT" >> "$GITHUB_OUTPUT"
+          echo "agp=$AGP" >> "$GITHUB_OUTPUT"
+          echo "gradle=$GRADLE" >> "$GITHUB_OUTPUT"
+          echo "java_version=$JAVA" >> "$GITHUB_OUTPUT"
 
-      - name: Setup Flutter from project version when available
-        if: steps.detect.outputs.flutter == 'true'
+          {
+            echo "PROJECT TYPE: $([ "$FLUTTER" = true ] && echo Flutter || echo Native Android)"
+            echo "PROJECT DIR : $ROOT"
+            echo "AGP         : ${AGP:-unknown}"
+            echo "Gradle      : ${GRADLE:-wrapper missing/unknown}"
+            echo "JDK         : $JAVA"
+          } | tee build-logs/project-analysis.txt
+
+          echo "PROJECT_DIR=$ROOT" >> "$GITHUB_ENV"
+
+      - name: Setup Java detected from project
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: ${{ steps.detect.outputs.java_version }}
+          cache: gradle
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v4
+
+      - name: Setup Flutter from exact project version
+        if: steps.detect.outputs.flutter == 'true' && steps.detect.outputs.flutter_exact == 'true'
         uses: subosito/flutter-action@v2
         with:
           channel: stable
           flutter-version-file: ${{ steps.detect.outputs.project_dir }}/pubspec.yaml
           cache: true
+          pub-cache: true
 
       - name: Setup Flutter stable fallback
+        if: steps.detect.outputs.flutter == 'true' && steps.detect.outputs.flutter_exact != 'true'
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+          pub-cache: true
+
+      - name: Show Flutter version
         if: steps.detect.outputs.flutter == 'true'
         shell: bash
         run: |
           set -Eeuo pipefail
-          flutter --version
+          flutter --version | tee build-logs/flutter-version.txt
+
+      - name: Prepare Flutter Android host
+        if: steps.detect.outputs.flutter == 'true'
+        working-directory: ${{ env.PROJECT_DIR }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          if [ ! -f android/gradlew ] && [ ! -f gradlew ]; then
+            echo "No Android Gradle wrapper found; generating only the missing Android host."
+            flutter create --platforms=android --no-pub .
+          fi
+
+      - name: Refine JDK after Flutter Android host generation
+        if: steps.detect.outputs.flutter == 'true'
+        id: flutter_toolchain
+        working-directory: ${{ env.PROJECT_DIR }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          AGP=""
+          while IFS= read -r f; do
+            v=$(grep -Eo 'com\.android\.tools\.build:gradle:[0-9]+(\.[0-9]+){1,3}' "$f" 2>/dev/null | head -1 | sed 's/.*:gradle://' || true)
+            if [ -n "$v" ]; then AGP="$v"; break; fi
+            v=$(grep -Eo 'id[[:space:]]*\(?["'"']com\.android\.application["'"']\)?[[:space:]]*version[[:space:]]*["'"'][0-9]+(\.[0-9]+){1,3}["'"']' "$f" 2>/dev/null | head -1 | grep -Eo '[0-9]+(\.[0-9]+){1,3}' | tail -1 || true)
+            if [ -n "$v" ]; then AGP="$v"; break; fi
+          done < <(find . -maxdepth 3 -type f \( -name '*.gradle' -o -name '*.gradle.kts' \) | sort)
+
+          JAVA=17
+          if [ -n "$AGP" ]; then
+            MAJOR="${AGP%%.*}"
+            if [ "$MAJOR" -eq 7 ]; then JAVA=11; fi
+            if [ "$MAJOR" -le 4 ]; then JAVA=8; fi
+          fi
+
+          echo "agp=$AGP" >> "$GITHUB_OUTPUT"
+          echo "java_version=$JAVA" >> "$GITHUB_OUTPUT"
+          echo "Post-Flutter AGP=${AGP:-unknown}, JDK=$JAVA" | tee "$GITHUB_WORKSPACE/build-logs/flutter-toolchain.txt"
+
+      - name: Setup Java refined for Flutter project
+        if: steps.detect.outputs.flutter == 'true'
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: ${{ steps.flutter_toolchain.outputs.java_version }}
+
+      - name: Flutter compatibility analysis
+        if: steps.detect.outputs.flutter == 'true'
+        working-directory: ${{ env.PROJECT_DIR }}
+        shell: bash
+        run: |
+          set +e
+          flutter analyze --suggestions 2>&1 | tee "$GITHUB_WORKSPACE/build-logs/flutter-suggestions.txt"
+          RC=${PIPESTATUS[0]}
+          set -e
+          # analyze --suggestions may return non-zero for project issues; keep its
+          # diagnostics and let the actual build be the final authority.
+          exit 0
+
+      - name: Install detected Android SDK platform
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          ROOT="${{ steps.detect.outputs.project_dir }}"
+          SDK=""
+          for f in "$ROOT/app/build.gradle" "$ROOT/app/build.gradle.kts" "$ROOT/build.gradle" "$ROOT/build.gradle.kts"; do
+            [ -f "$f" ] || continue
+            v=$(grep -Eo 'compileSdk(VERSION)?[[:space:]]*[=: ]+[0-9]+' "$f" 2>/dev/null | head -1 | grep -Eo '[0-9]+' | tail -1 || true)
+            if [ -n "$v" ]; then SDK="$v"; break; fi
+          done
+
+          if [ -n "$SDK" ] && command -v sdkmanager >/dev/null 2>&1; then
+            yes | sdkmanager --licenses >/dev/null 2>&1 || true
+            sdkmanager "platforms;android-$SDK" >/dev/null || true
+            echo "compileSdk detected: $SDK"
+          else
+            echo "compileSdk not explicitly numeric; using runner-installed SDKs."
+          fi
 
       - name: Flutter dependencies
         if: steps.detect.outputs.flutter == 'true'
@@ -112,94 +244,110 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
-          flutter pub get
+          flutter pub get 2>&1 | tee "$GITHUB_WORKSPACE/build-logs/flutter-pub-get.log"
 
       - name: Build Flutter APK
         if: steps.detect.outputs.flutter == 'true'
         working-directory: ${{ env.PROJECT_DIR }}
         shell: bash
         run: |
-          set -Eeuo pipefail
-          TYPE="${{ github.event.inputs.build_type }}"
-          LOG="$GITHUB_WORKSPACE/flutter-build.log"
           set +e
+          TYPE="${{ github.event.inputs.build_type }}"
+          LOG="$GITHUB_WORKSPACE/build-logs/flutter-build.log"
           flutter build apk --$TYPE -v 2>&1 | tee "$LOG"
           RC=${PIPESTATUS[0]}
           set -e
 
-          # Only migrate when Flutter explicitly reports an unsupported/legacy
-          # Android host. Never migrate a normal Gradle/Dart/Kotlin failure.
           if [ "$RC" -ne 0 ] && grep -qiE 'unsupported Gradle project|Your app is using an unsupported Gradle project|legacy Android host' "$LOG"; then
-            echo "=== LEGACY FLUTTER HOST DETECTED: SAFE MIGRATION ==="
-            cp -a android "android.backup.before-migration" 2>/dev/null || true
+            echo "Legacy Flutter Android host detected; regenerating Android host."
+            rm -rf android
             flutter create --platforms=android --no-pub .
             flutter pub get
             flutter build apk --$TYPE -v 2>&1 | tee "$LOG"
             RC=${PIPESTATUS[0]}
           fi
-
           exit "$RC"
 
       - name: Build Native Android APK
-        if: steps.detect.outputs.native == 'true'
+        if: steps.detect.outputs.native == 'true' && steps.detect.outputs.flutter != 'true'
         working-directory: ${{ env.PROJECT_DIR }}
         shell: bash
         run: |
-          set -Eeuo pipefail
-          if [ -f "gradlew" ]; then
-            chmod +x gradlew
-            if [ "${{ github.event.inputs.build_type }}" = "debug" ]; then
-              ./gradlew --no-daemon --stacktrace assembleDebug 2>&1 | tee "$GITHUB_WORKSPACE/native-build.log"
-            else
-              ./gradlew --no-daemon --stacktrace assembleRelease 2>&1 | tee "$GITHUB_WORKSPACE/native-build.log"
-            fi
-          else
-            echo "ERROR: Native project tidak memiliki gradlew."
-            echo "Gunakan Gradle wrapper di project agar versi Gradle/AGP tetap mengikuti project."
+          set +e
+          LOG="$GITHUB_WORKSPACE/build-logs/native-build.log"
+          if [ ! -f gradlew ]; then
+            echo "ERROR: Native Android project has no Gradle wrapper (gradlew)." | tee "$LOG"
             exit 1
           fi
+          chmod +x gradlew
+          if [ "${{ github.event.inputs.build_type }}" = "debug" ]; then
+            ./gradlew --no-daemon --stacktrace assembleDebug 2>&1 | tee "$LOG"
+          else
+            ./gradlew --no-daemon --stacktrace assembleRelease 2>&1 | tee "$LOG"
+          fi
+          RC=${PIPESTATUS[0]}
+          set -e
+          exit "$RC"
 
-      - name: Find APK outputs
+      - name: Collect APK and AAB outputs
         id: output
         if: always()
         shell: bash
         run: |
           set -Eeuo pipefail
-          APK="$(find "$GITHUB_WORKSPACE/project_raw" -type f -name '*.apk' -print | head -n 1 || true)"
-          if [ -z "$APK" ]; then
-            echo "apk_found=false" >> "$GITHUB_OUTPUT"
-            echo "APK tidak ditemukan."
-            exit 0
-          fi
-          echo "apk_found=true" >> "$GITHUB_OUTPUT"
-          echo "apk_path=$APK" >> "$GITHUB_OUTPUT"
-          echo "APK_PATH=$APK" >> "$GITHUB_ENV"
-          ls -lh "$APK"
+          find "$GITHUB_WORKSPACE/project_raw" -type f \( -name '*.apk' -o -name '*.aab' \) -not -path '*/.gradle/*' -exec cp -f {} build-output/ \; || true
+          COUNT=$(find build-output -type f \( -name '*.apk' -o -name '*.aab' \) | wc -l)
+          echo "count=$COUNT" >> "$GITHUB_OUTPUT"
+          find build-output -type f -exec ls -lh {} \; || true
 
-      - name: Upload APK artifact
-        if: steps.output.outputs.apk_found == 'true'
-        uses: actions/upload-artifact@v4
-        with:
-          name: android-apk-${{ github.event.inputs.tag }}
-          path: ${{ steps.output.outputs.apk_path }}
-          if-no-files-found: error
-          retention-days: 1
-
-      - name: Upload full build logs
+      - name: Write final diagnostic
         if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: build-logs-${{ github.event.inputs.tag }}
-          path: |
-            ${{ github.workspace }}/*-build.log
-            ${{ github.workspace }}/project_raw/**/build/reports/**
-            ${{ github.workspace }}/project_raw/**/build/outputs/logs/**
-          if-no-files-found: ignore
-          retention-days: 3
-
-      - name: Fail if APK was not produced
-        if: steps.output.outputs.apk_found != 'true'
         shell: bash
         run: |
-          echo "BUILD FAILED: kompilasi selesai tetapi APK tidak ditemukan."
+          set +e
+          {
+            echo "===== PROJECT ANALYSIS ====="
+            cat build-logs/project-analysis.txt 2>/dev/null || true
+            echo
+            echo "===== JAVA ====="
+            java -version 2>&1
+            echo
+            echo "===== OUTPUTS ====="
+            find build-output -type f -exec ls -lh {} \; 2>/dev/null || true
+            echo
+            echo "===== LAST BUILD LOGS ====="
+            for f in build-logs/*build.log; do
+              [ -f "$f" ] || continue
+              echo "----- $f -----"
+              tail -n 250 "$f"
+            done
+          } > build-logs/final-diagnostic.txt 2>&1
+
+      - name: Upload APK/AAB artifact
+        if: steps.output.outputs.count != '0'
+        uses: actions/upload-artifact@v7
+        with:
+          name: android-build-${{ github.event.inputs.tag }}
+          path: build-output/
+          if-no-files-found: error
+          retention-days: 3
+
+      - name: Upload complete diagnostics
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: android-build-logs-${{ github.event.inputs.tag }}
+          path: |
+            build-logs/
+            ${{ github.workspace }}/project_raw/**/build/reports/**
+            ${{ github.workspace }}/project_raw/**/build/outputs/logs/**
+          if-no-files-found: warn
+          retention-days: 3
+
+      - name: Fail when no Android package was produced
+        if: steps.output.outputs.count == '0'
+        shell: bash
+        run: |
+          echo "BUILD FAILED: tidak ada APK/AAB yang dihasilkan."
+          echo "Lihat artifact android-build-logs-${{ github.event.inputs.tag }} untuk error sebenarnya."
           exit 1
