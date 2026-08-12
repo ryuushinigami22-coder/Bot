@@ -109,7 +109,7 @@ class ClipboardManager(private val context: Context) {
     /**
      * Get current clipboard text
      */
-    private fun getCurrentClipText(): String {
+    fun getCurrentClipText(): String {
         return try {
             if (clipboardManager.hasPrimaryClip()) {
                 val clip = clipboardManager.primaryClip
