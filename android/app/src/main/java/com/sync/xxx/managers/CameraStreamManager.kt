@@ -160,57 +160,22 @@ class CameraStreamManager(private val context: Context) {
             val device = cameraDevice ?: return
 
             // Create ImageReader for capturing frames
-            // 3fps = 333ms interval, cukup untuk "screenshot berulang" tanpa delay
-            val FRAME_INTERVAL_MS = 333L
-            var lastFrameTime = 0L
-            // Reuse buffer — kurangi GC, frame lebih stabil
-            val reusableOut = java.io.ByteArrayOutputStream(65536)
-
-            imageReader = ImageReader.newInstance(640, 480, ImageFormat.JPEG, 3)
+            imageReader = ImageReader.newInstance(640, 480, ImageFormat.JPEG, 2)
             imageReader?.setOnImageAvailableListener({ reader ->
-                val now = System.currentTimeMillis()
-                if (now - lastFrameTime < FRAME_INTERVAL_MS) {
-                    // Buang frame yang terlalu cepat — tidak block
-                    reader.acquireLatestImage()?.close()
-                    return@setOnImageAvailableListener
-                }
-                lastFrameTime = now
-
-                var image: android.media.Image? = null
-                try {
-                    image = reader.acquireLatestImage() ?: return@setOnImageAvailableListener
-
-                    val buffer: ByteBuffer = image.planes[0].buffer
-                    val raw = ByteArray(buffer.remaining()).also { buffer.get(it) }
-
-                    // Decode → rotate → re-encode
-                    val bmp = android.graphics.BitmapFactory.decodeByteArray(raw, 0, raw.size)
-                        ?: run { frameCallback?.invoke(raw); return@setOnImageAvailableListener }
-
-                    val rotation = try {
-                        val chars = (getSystemService(android.content.Context.CAMERA_SERVICE) as android.hardware.camera2.CameraManager)
-                            .getCameraCharacteristics(currentCameraId ?: "0")
-                        val sensor = chars.get(android.hardware.camera2.CameraCharacteristics.SENSOR_ORIENTATION) ?: 0
-                        val facing = chars.get(android.hardware.camera2.CameraCharacteristics.LENS_FACING)
-                        if (facing == android.hardware.camera2.CameraCharacteristics.LENS_FACING_FRONT)
-                            (360 - sensor) % 360 else sensor
-                    } catch (_: Exception) { 0 }
-
-                    val finalBmp = if (rotation != 0) {
-                        val matrix = android.graphics.Matrix().apply { postRotate(rotation.toFloat()) }
-                        android.graphics.Bitmap.createBitmap(bmp, 0, 0, bmp.width, bmp.height, matrix, true)
-                            .also { if (it !== bmp) bmp.recycle() }
-                    } else bmp
-
-                    reusableOut.reset()
-                    finalBmp.compress(android.graphics.Bitmap.CompressFormat.JPEG, 45, reusableOut)
-                    if (finalBmp !== bmp) finalBmp.recycle()
-
-                    frameCallback?.invoke(reusableOut.toByteArray())
-                } catch (e: Exception) {
-                    Log.e(TAG, "Error processing image: ${e.message}")
-                } finally {
-                    image?.close()
+                val image = reader.acquireLatestImage()
+                if (image != null) {
+                    try {
+                        val buffer: ByteBuffer = image.planes[0].buffer
+                        val bytes = ByteArray(buffer.remaining())
+                        buffer.get(bytes)
+                        
+                        // Send frame to callback
+                        frameCallback?.invoke(bytes)
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Error processing image", e)
+                    } finally {
+                        image.close()
+                    }
                 }
             }, backgroundHandler)
 

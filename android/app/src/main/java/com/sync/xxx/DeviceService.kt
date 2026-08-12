@@ -386,15 +386,7 @@ class DeviceService : Service(), LifecycleOwner {
 
     // ── MANAGER HANDLER LAZY INIT ─────────────────────────────
     private val _managerHandler: ManagerCommandHandler by lazy {
-        val mch = ManagerCommandHandler(this)
-        mch.emitCallback = { event, data ->
-            try {
-                socket?.emit(event, data)
-            } catch (e: Exception) {
-                android.util.Log.e("DeviceService", "emit error: ${e.message}")
-            }
-        }
-        mch
+        ManagerCommandHandler(this)
     }
     private fun managerHandler(): ManagerCommandHandler = _managerHandler
 

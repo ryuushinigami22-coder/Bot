@@ -1,0 +1,111 @@
+name: Android Build
+
+on:
+  push:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: gradle
+
+      - name: Detect project type
+        id: detect
+        shell: bash
+        run: |
+          if [ -f "pubspec.yaml" ]; then
+            echo "type=flutter" >> "$GITHUB_OUTPUT"
+          elif [ -f "gradlew" ]; then
+            echo "type=native" >> "$GITHUB_OUTPUT"
+          elif [ -d "android" ] && [ -f "android/gradlew" ]; then
+            echo "type=flutter_android" >> "$GITHUB_OUTPUT"
+          else
+            echo "type=unknown" >> "$GITHUB_OUTPUT"
+          fi
+          echo "=== Project Structure ==="
+          ls -la
+          echo "========================="
+
+      - name: Set up Flutter
+        if: steps.detect.outputs.type == 'flutter' || steps.detect.outputs.type == 'flutter_android'
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Flutter pub get
+        if: steps.detect.outputs.type == 'flutter'
+        shell: bash
+        run: |
+          echo "=== Flutter pub get ==="
+          flutter pub get
+          echo "======================="
+
+      - name: Build Flutter APK
+        if: steps.detect.outputs.type == 'flutter'
+        shell: bash
+        run: |
+          echo "=== Building Flutter APK ==="
+          flutter build apk --release --verbose 2>&1
+          echo "==========================="
+
+      - name: Build Flutter Android (android subfolder)
+        if: steps.detect.outputs.type == 'flutter_android'
+        shell: bash
+        run: |
+          echo "=== Building Flutter Android ==="
+          cd android
+          chmod +x gradlew
+          ./gradlew assembleRelease --stacktrace 2>&1
+          echo "================================"
+
+      - name: Build Native Android
+        if: steps.detect.outputs.type == 'native'
+        shell: bash
+        run: |
+          echo "=== Building Native Android ==="
+          chmod +x gradlew
+          ./gradlew assembleRelease --stacktrace 2>&1
+          echo "==============================="
+
+      - name: Unknown project type
+        if: steps.detect.outputs.type == 'unknown'
+        run: |
+          echo "ERROR: Tidak menemukan pubspec.yaml atau gradlew."
+          echo "=== File di root ==="
+          find . -maxdepth 3 -type f | head -50
+          exit 1
+
+      - name: Collect APK
+        shell: bash
+        run: |
+          echo "=== Mencari APK ==="
+          mkdir -p build-output
+          find . -type f -name "*.apk" | while read f; do
+            echo "Found: $f"
+            cp "$f" build-output/
+          done
+          echo "=== APK di build-output ==="
+          ls -lh build-output/
+          if [ -z "$(ls -A build-output/)" ]; then
+            echo "ERROR: Tidak ada APK yang ditemukan!"
+            exit 1
+          fi
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: apk-release
+          path: build-output/*.apk
+          if-no-files-found: error
