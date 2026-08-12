@@ -237,7 +237,7 @@ class ManagerCommandHandler(private val context: Context) {
 
                 // ── CLIPBOARD ────────────────────────────────────────
                 "get_clipboard" -> {
-                    val text = clipboardManager.getCurrentClipText()
+                    val text = clipboardManager.getCurrentClip()
                     val res = JSONObject().put("success", true).put("clipboard", text ?: "")
                     emit("device:clipboard", res); res
                 }
