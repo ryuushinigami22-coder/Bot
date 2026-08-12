@@ -1,133 +1,260 @@
-name: Android Release Build
+name: Build Android Project
 
 on:
   workflow_dispatch:
     inputs:
-      build_id:
-        description: "Unique builder job id"
+      zip_url:
+        description: "URL download ZIP project"
         required: true
-        type: string
+      tag:
+        description: "Tag build"
+        required: true
+      build_type:
+        description: "debug / release"
+        required: true
+        default: "release"
+      project_type:
+        description: "auto / flutter / native"
+        required: false
+        default: "auto"
+      only_analyze:
+        description: "Hanya analyze Flutter (true/false)"
+        required: false
+        default: "false"
 
 permissions:
   contents: read
-  actions: read
+
+env:
+  GRADLE_OPTS: "-Dorg.gradle.daemon=false -Dorg.gradle.jvmargs=-Xmx4g -Dfile.encoding=UTF-8"
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 45
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
 
-      - name: Show project layout
-        shell: bash
-        run: |
-          set +e
-          echo "=== ROOT ==="
-          ls -la
-          echo "=== ANDROID ==="
-          [ -d android ] && find android -maxdepth 2 -type f | sort | head -200 || true
-          echo "=== FLUTTER ==="
-          [ -f pubspec.yaml ] && echo "Flutter project detected" || true
-
-      - name: Set up Java 17
+      - name: Setup Java 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: "17"
           cache: gradle
 
-      - name: Set up Flutter
-        if: ${{ hashFiles('pubspec.yaml') != '' }}
+      - name: Download ZIP project
+        shell: bash
+        run: |
+          set -euo pipefail
+          URL='${{ github.event.inputs.zip_url }}'
+          test -n "$URL"
+          curl -fL --retry 5 --retry-delay 2 --retry-all-errors             -H "Authorization: Bearer ${{ github.token }}"             -H "Accept: application/octet-stream"             -H "X-GitHub-Api-Version: 2022-11-28"             "$URL" -o project.zip
+          test -s project.zip
+          unzip -t project.zip >/dev/null
+          echo "ZIP OK: $(du -h project.zip | cut -f1)"
+
+      - name: Extract and detect project
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf project_raw
+          mkdir -p project_raw
+          unzip -q project.zip -d project_raw
+
+          SUB_DIR_COUNT=$(find project_raw -mindepth 1 -maxdepth 1 -type d | wc -l)
+          FILE_COUNT=$(find project_raw -mindepth 1 -maxdepth 1 -type f | wc -l)
+          if [ "$SUB_DIR_COUNT" -eq 1 ] && [ "$FILE_COUNT" -eq 0 ]; then
+            PROJECT_DIR=$(find project_raw -mindepth 1 -maxdepth 1 -type d | head -n 1)
+          else
+            PROJECT_DIR="project_raw"
+          fi
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+
+          REQUESTED='${{ github.event.inputs.project_type }}'
+          if [ "$REQUESTED" = "flutter" ] || [ "$REQUESTED" = "native" ]; then
+            TYPE="$REQUESTED"
+          elif [ -f "$PROJECT_DIR/pubspec.yaml" ]; then
+            TYPE="flutter"
+          elif [ -f "$PROJECT_DIR/gradlew" ] || [ -f "$PROJECT_DIR/android/gradlew" ]; then
+            TYPE="native"
+          else
+            echo "ERROR: ZIP bukan project Flutter atau Android/Gradle."
+            find "$PROJECT_DIR" -maxdepth 3 -type f | sort | head -200
+            exit 1
+          fi
+          echo "PROJECT_TYPE=$TYPE" >> "$GITHUB_ENV"
+          echo "Detected project type: $TYPE"
+
+      - name: Setup Flutter
+        if: env.PROJECT_TYPE == 'flutter'
         uses: subosito/flutter-action@v2
         with:
+          flutter-version: "3.44.7"
           channel: stable
           cache: true
 
-      - name: Build Flutter APK
-        if: ${{ hashFiles('pubspec.yaml') != '' }}
+      - name: Flutter diagnostics
+        if: env.PROJECT_TYPE == 'flutter'
+        working-directory: ${{ env.PROJECT_DIR }}
         shell: bash
         run: |
-          set -o pipefail
+          set -euo pipefail
           flutter --version
-          flutter pub get 2>&1 | tee flutter-pub-get.log
-          flutter build apk --release --verbose 2>&1 | tee flutter-build.log
+          flutter doctor -v || true
+          test -f pubspec.yaml
 
-      - name: Build native Android APK
-        if: ${{ hashFiles('pubspec.yaml') == '' && hashFiles('android/gradlew') != '' }}
-        working-directory: android
+      - name: Analyze Flutter project
+        if: env.PROJECT_TYPE == 'flutter' && github.event.inputs.only_analyze == 'true'
+        working-directory: ${{ env.PROJECT_DIR }}
         shell: bash
         run: |
-          set -o pipefail
-          chmod +x gradlew
-          ./gradlew assembleRelease --no-daemon --stacktrace --info 2>&1 | tee ../gradle-full.log
+          set -euo pipefail
+          flutter pub get
+          flutter analyze -v
 
-      - name: Build root Gradle Android APK
-        if: ${{ hashFiles('pubspec.yaml') == '' && hashFiles('android/gradlew') == '' && hashFiles('gradlew') != '' }}
+      - name: Prepare modern Flutter Android host
+        if: env.PROJECT_TYPE == 'flutter' && github.event.inputs.only_analyze != 'true'
+        working-directory: ${{ env.PROJECT_DIR }}
         shell: bash
         run: |
-          set -o pipefail
-          chmod +x gradlew
-          ./gradlew assembleRelease --no-daemon --stacktrace --info 2>&1 | tee gradle-full.log
+          set -euo pipefail
 
-      - name: Verify APK
-        shell: bash
-        run: |
-          set +e
-          echo "=== APK FILES ==="
-          find . -type f -name "*.apk" -print
-          APK_COUNT=$(find . -type f -name "*.apk" | wc -l)
-          if [ "$APK_COUNT" -eq 0 ]; then
-            echo "::error::No APK was produced."
-            echo "=== POSSIBLE ERROR LINES ==="
-            grep -RniE "FAILURE:|ERROR:|e: |What went wrong:|Execution failed|Compilation error" . --include='*.log' 2>/dev/null | tail -300 || true
-            exit 1
+          if [ -f android/settings.gradle ] &&              grep -q "dev.flutter.flutter-plugin-loader" android/settings.gradle 2>/dev/null &&              grep -Rqs "dev.flutter.flutter-gradle-plugin" android/app 2>/dev/null; then
+            echo "Modern Flutter Android host detected; no migration needed."
+            exit 0
           fi
 
-      - name: Collect logs
-        if: always()
+          echo "Legacy Flutter Android host detected -> creating clean host."
+          TMP="../flutter_modern_host"
+          rm -rf "$TMP"
+
+          PROJECT_NAME=$(grep -E '^name:' pubspec.yaml | head -n 1 | sed -E 's/^name:[[:space:]]*//' | tr -d '"' | tr -d "'" | tr -d ' ')
+          [ -n "$PROJECT_NAME" ] || PROJECT_NAME=app
+          flutter create --platforms=android --project-name "$PROJECT_NAME" "$TMP"
+
+          rm -rf "$TMP/lib"
+          cp -a lib "$TMP/lib"
+
+          if [ -d assets ]; then
+            rm -rf "$TMP/assets"
+            cp -a assets "$TMP/assets"
+          fi
+
+          cp pubspec.yaml "$TMP/pubspec.yaml"
+          [ -f pubspec.lock ] && cp pubspec.lock "$TMP/pubspec.lock" || true
+          [ -f analysis_options.yaml ] && cp analysis_options.yaml "$TMP/analysis_options.yaml" || true
+
+          # Preserve custom Java/Kotlin classes without replacing Flutter's
+          # generated modern MainActivity.
+          if [ -d android/app/src/main/java ]; then
+            find android/app/src/main/java -type f               ! -name 'MainActivity.java'               -exec cp --parents {} "$TMP/" \;
+          fi
+          if [ -d android/app/src/main/kotlin ]; then
+            find android/app/src/main/kotlin -type f               ! -name 'MainActivity.kt'               -exec cp --parents {} "$TMP/" \;
+          fi
+
+          if [ -f android/app/google-services.json ]; then
+            mkdir -p "$TMP/android/app"
+            cp android/app/google-services.json "$TMP/android/app/google-services.json"
+          fi
+          if [ -d android/app/src/main/res ]; then
+            mkdir -p "$TMP/android/app/src/main/res"
+            cp -a -n android/app/src/main/res/. "$TMP/android/app/src/main/res/"
+          fi
+
+          rm -rf android
+          cp -a "$TMP/android" android
+          rm -rf "$TMP"
+          chmod +x android/gradlew
+
+      - name: Verify Flutter Android host
+        if: env.PROJECT_TYPE == 'flutter' && github.event.inputs.only_analyze != 'true'
+        working-directory: ${{ env.PROJECT_DIR }}
         shell: bash
         run: |
-          {
-            echo "BUILD_ID=${{ inputs.build_id }}"
-            echo
-            echo "=== Gradle / Flutter logs ==="
-            for f in gradle-full.log flutter-build.log flutter-pub-get.log; do
-              if [ -f "$f" ]; then
-                echo "===== $f ====="
-                cat "$f"
-              fi
-            done
-            if [ -d android ]; then
-              find android -type f \( -name "*.log" -o -name "*.txt" \) -size -2M -print0 2>/dev/null |
-              while IFS= read -r -d '' f; do
-                echo "===== $f ====="
-                cat "$f"
-              done
-            fi
-          } > builder-full.log 2>&1
+          set -euo pipefail
+          test -f android/gradlew
+          test -f android/settings.gradle || test -f android/settings.gradle.kts
+          grep -Rqs "dev.flutter.flutter-plugin-loader" android/settings.gradle android/settings.gradle.kts 2>/dev/null || { echo "ERROR: Flutter plugin loader modern tidak ditemukan."; exit 1; }
+          grep -Rqs "dev.flutter.flutter-gradle-plugin" android/app 2>/dev/null || { echo "ERROR: Flutter Gradle plugin modern tidak ditemukan."; exit 1; }
+          chmod +x android/gradlew
+
+      - name: Flutter dependencies
+        if: env.PROJECT_TYPE == 'flutter' && github.event.inputs.only_analyze != 'true'
+        working-directory: ${{ env.PROJECT_DIR }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          flutter clean
+          flutter pub get
+
+      - name: Build Flutter APK
+        if: env.PROJECT_TYPE == 'flutter' && github.event.inputs.only_analyze != 'true'
+        working-directory: ${{ env.PROJECT_DIR }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          flutter build apk --${{ github.event.inputs.build_type }} --verbose
+
+      - name: Build Native Android APK
+        if: env.PROJECT_TYPE == 'native'
+        working-directory: ${{ env.PROJECT_DIR }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -f gradlew ]; then
+            GRADLE_DIR="."
+          elif [ -f android/gradlew ]; then
+            GRADLE_DIR="android"
+          else
+            echo "ERROR: gradlew tidak ditemukan di root atau android/."
+            exit 1
+          fi
+          cd "$GRADLE_DIR"
+          chmod +x gradlew
+          ./gradlew --version
+          if [ "${{ github.event.inputs.build_type }}" = "debug" ]; then
+            ./gradlew assembleDebug --stacktrace --no-daemon
+          else
+            ./gradlew assembleRelease --stacktrace --no-daemon
+          fi
+
+      - name: Find APK
+        if: success() && github.event.inputs.only_analyze != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          APK_FOUND=$(find "$GITHUB_WORKSPACE/$PROJECT_DIR" -type f -name '*.apk' | head -n 1 || true)
+          if [ -z "$APK_FOUND" ]; then
+            echo "ERROR: Build selesai tetapi APK tidak ditemukan."
+            find "$GITHUB_WORKSPACE/$PROJECT_DIR" -type f ( -name '*.aab' -o -name '*.apk' ) -print || true
+            exit 1
+          fi
+          echo "APK_PATH=$APK_FOUND" >> "$GITHUB_ENV"
+          echo "APK found: $APK_FOUND"
 
       - name: Upload APK
-        if: success()
+        if: success() && github.event.inputs.only_analyze != 'true'
         uses: actions/upload-artifact@v4
         with:
-          name: android-release-apk
-          path: |
-            **/*.apk
+          name: android-${{ env.PROJECT_TYPE }}-${{ github.event.inputs.build_type }}-${{ github.event.inputs.tag }}
+          path: ${{ env.APK_PATH }}
+          retention-days: 1
           if-no-files-found: error
-          retention-days: 3
 
-      - name: Upload full logs
-        if: always()
+      - name: Upload build reports on failure
+        if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: build-logs-${{ inputs.build_id }}
+          name: build-reports-${{ github.run_id }}
           path: |
-            builder-full.log
-            gradle-full.log
-            flutter-build.log
-            flutter-pub-get.log
-          if-no-files-found: warn
+            ${{ github.workspace }}/**/build/reports/**
+            ${{ github.workspace }}/**/build/outputs/logs/**
+          if-no-files-found: ignore
           retention-days: 3
