@@ -1,0 +1,60 @@
+name: Android Build
+
+on:
+  push:
+    branches:
+      - '*'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
+
+      - name: Build Native Android APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -f ./gradlew ]; then
+            chmod +x ./gradlew
+            ./gradlew assembleRelease --stacktrace
+          elif [ -f ./android/gradlew ]; then
+            cd android
+            chmod +x ./gradlew
+            ./gradlew assembleRelease --stacktrace
+          else
+            echo 'ERROR: gradlew tidak ditemukan di root atau android/'
+            exit 1
+          fi
+
+      - name: Collect APK
+        if: success()
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf output
+          mkdir -p output
+          find . -type f -name '*.apk' -not -path './.git/*' -print -exec cp {} output/ \;
+          echo 'APK output:'
+          ls -lah output/
+          test -n "$(find output -type f -name '*.apk' -print -quit)"
+
+      - name: Upload APK artifact
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: apk-output
+          path: output/*.apk
+          if-no-files-found: error
