@@ -23,7 +23,8 @@ on:
         default: "false"
       user_id:
         description: "Telegram user ID"
-        required: true
+        required: false
+        default: "unknown"
 
 permissions:
   contents: read
