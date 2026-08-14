@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       zip_url:
-        description: "Project ZIP download URL"
+        description: "URL download ZIP project"
         required: true
       tag:
         description: "Unique build tag"
@@ -15,11 +15,19 @@ on:
         default: "release"
         type: choice
         options:
-          - debug
           - release
+          - debug
+      only_analyze:
+        description: "Analyze only"
+        required: false
+        default: "false"
+      user_id:
+        description: "Telegram user ID"
+        required: true
 
 permissions:
   contents: read
+  actions: write
 
 env:
   GRADLE_OPTS: "-Dorg.gradle.daemon=false -Dorg.gradle.jvmargs=-Xmx4g -Dfile.encoding=UTF-8"
@@ -38,114 +46,91 @@ jobs:
           mkdir -p project_raw build-output build-logs
           echo "Workspace ready."
 
-      - name: Download project
+      - name: Download and prepare project
+        id: prepare
         shell: bash
+        env:
+          ZIP_URL: ${{ inputs.zip_url }}
+          USER_ID: ${{ inputs.user_id }}
         run: |
           set -Eeuo pipefail
-          echo "Downloading project archive..."
-          curl --fail --silent --show-error --location             --retry 5 --retry-all-errors --connect-timeout 20 --max-time 600             -H "Authorization: Bearer ${{ secrets.GH_TOKEN }}"             -H "Accept: application/octet-stream"             "${{ github.event.inputs.zip_url }}"             -o project.zip
+
+          echo "📥 Downloading project..."
+          curl -fL --retry 5 --retry-all-errors --connect-timeout 20 --max-time 600 \
+            -H "Authorization: Bearer ${{ secrets.GH_TOKEN }}" \
+            -H "Accept: application/octet-stream" \
+            -o project.zip "$ZIP_URL"
 
           test -s project.zip
-          echo "ZIP size: $(du -h project.zip | cut -f1)"
           unzip -t project.zip >/dev/null
           unzip -q project.zip -d project_raw
-          echo "ZIP extracted successfully."
 
-      - name: Detect project and toolchain
-        id: detect
-        shell: bash
-        run: |
-          set -Eeuo pipefail
+          SAFE_USER_ID="$(printf '%s' "$USER_ID" | tr -cd '0-9_-')"
+          [ -n "$SAFE_USER_ID" ] || SAFE_USER_ID="unknown"
+          USER_BUILD_DIR="$GITHUB_WORKSPACE/builds/$SAFE_USER_ID"
+          rm -rf "$GITHUB_WORKSPACE/builds"
+          mkdir -p "$USER_BUILD_DIR"
+          cp -a project_raw/. "$USER_BUILD_DIR/"
 
-          BASE="$GITHUB_WORKSPACE/project_raw"
+          PUBSPEC="$(find "$USER_BUILD_DIR" -type f -name pubspec.yaml \
+            -not -path '*/.dart_tool/*' -not -path '*/.git/*' -print -quit || true)"
 
-          PUBSPEC="$(find "$BASE" -type f -name pubspec.yaml -not -path '*/.dart_tool/*' -print -quit || true)"
-          GRADLEW="$(find "$BASE" -type f -name gradlew -not -path '*/.gradle/*' -print -quit || true)"
-          SETTINGS="$(find "$BASE" -type f ( -name settings.gradle -o -name settings.gradle.kts ) -not -path '*/.gradle/*' -print -quit || true)"
-          BUILD_GRADLE="$(find "$BASE" -type f ( -name build.gradle -o -name build.gradle.kts ) -not -path '*/.gradle/*' -print -quit || true)"
+          GRADLEW="$(find "$USER_BUILD_DIR" -type f -name gradlew \
+            -not -path '*/.gradle/*' -not -path '*/.git/*' -print -quit || true)"
 
-          FLUTTER=false
-          NATIVE=false
-          PROJECT_DIR=""
+          SETTINGS="$(find "$USER_BUILD_DIR" -type f \
+            \( -name settings.gradle -o -name settings.gradle.kts \) \
+            -not -path '*/.gradle/*' -not -path '*/.git/*' -print -quit || true)"
+
+          BUILD_GRADLE="$(find "$USER_BUILD_DIR" -type f \
+            \( -name build.gradle -o -name build.gradle.kts \) \
+            -not -path '*/.gradle/*' -not -path '*/.git/*' -print -quit || true)"
 
           if [ -n "$PUBSPEC" ]; then
-            FLUTTER=true
+            PROJECT_TYPE="flutter"
             PROJECT_DIR="$(dirname "$PUBSPEC")"
-          fi
-
-          if [ -n "$GRADLEW" ] || [ -n "$SETTINGS" ] || [ -n "$BUILD_GRADLE" ]; then
-            NATIVE=true
-            if [ -z "$PROJECT_DIR" ]; then
-              if [ -n "$GRADLEW" ]; then
-                PROJECT_DIR="$(dirname "$GRADLEW")"
-              elif [ -n "$SETTINGS" ]; then
-                PROJECT_DIR="$(dirname "$SETTINGS")"
-              else
-                PROJECT_DIR="$(dirname "$BUILD_GRADLE")"
-              fi
-            fi
-          fi
-
-          if [ "$FLUTTER" = false ] && [ "$NATIVE" = false ]; then
-            echo "::error::ZIP tidak berisi project Flutter atau Android Native."
-            echo "File marker yang ditemukan:"
-            find "$BASE" -maxdepth 5 -type f | sort | head -250
+          elif [ -n "$GRADLEW" ]; then
+            PROJECT_TYPE="native"
+            PROJECT_DIR="$(dirname "$GRADLEW")"
+          elif [ -n "$SETTINGS" ]; then
+            PROJECT_TYPE="native"
+            PROJECT_DIR="$(dirname "$SETTINGS")"
+          elif [ -n "$BUILD_GRADLE" ]; then
+            PROJECT_TYPE="native"
+            PROJECT_DIR="$(dirname "$BUILD_GRADLE")"
+          else
+            echo "::error::Project Flutter/Native tidak ditemukan."
+            echo "Marker yang dicari: pubspec.yaml, gradlew, settings.gradle(.kts), build.gradle(.kts)"
+            find "$USER_BUILD_DIR" -maxdepth 6 -type f | sort | head -300
             exit 1
           fi
 
-          # A Flutter project is built as Flutter even though it also contains Gradle files.
-          if [ "$FLUTTER" = true ]; then
-            PROJECT_TYPE="flutter"
-          else
-            PROJECT_TYPE="native"
-          fi
-
-          AGP=""
-          while IFS= read -r f; do
-            [ -f "$f" ] || continue
-            v="$(grep -Eho 'com.android.tools.build:gradle:[0-9]+(.[0-9]+){1,3}' "$f" 2>/dev/null | head -1 | sed 's/.*:gradle://' || true)"
-            if [ -n "$v" ]; then
-              AGP="$v"
-              break
-            fi
-          done < <(find "$PROJECT_DIR" -maxdepth 5 -type f ( -name '*.gradle' -o -name '*.gradle.kts' ) | sort)
-
-          JAVA=17
-          if [ -n "$AGP" ]; then
-            MAJOR="${AGP%%.*}"
-            if [ "$MAJOR" -eq 7 ]; then JAVA=11; fi
-            if [ "$MAJOR" -le 4 ]; then JAVA=8; fi
-          fi
-
-          echo "project_dir=$PROJECT_DIR" >> "$GITHUB_OUTPUT"
-          echo "project_type=$PROJECT_TYPE" >> "$GITHUB_OUTPUT"
-          echo "flutter=$FLUTTER" >> "$GITHUB_OUTPUT"
-          echo "native=$NATIVE" >> "$GITHUB_OUTPUT"
-          echo "agp=$AGP" >> "$GITHUB_OUTPUT"
-          echo "java_version=$JAVA" >> "$GITHUB_OUTPUT"
+          echo "BUILD_DIR=$USER_BUILD_DIR" >> "$GITHUB_ENV"
           echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+          echo "PROJECT_TYPE=$PROJECT_TYPE" >> "$GITHUB_ENV"
+          echo "SAFE_USER_ID=$SAFE_USER_ID" >> "$GITHUB_ENV"
 
           {
-            echo "PROJECT TYPE : $PROJECT_TYPE"
-            echo "PROJECT DIR  : $PROJECT_DIR"
-            echo "AGP          : ${AGP:-unknown}"
-            echo "JDK          : $JAVA"
-            echo "PUBSPEC      : ${PUBSPEC:-not found}"
-            echo "GRADLEW      : ${GRADLEW:-not found}"
-          } | tee "$GITHUB_WORKSPACE/build-logs/project-analysis.txt"
+            echo "PROJECT_TYPE=$PROJECT_TYPE"
+            echo "PROJECT_DIR=$PROJECT_DIR"
+            echo "USER_BUILD_DIR=$USER_BUILD_DIR"
+            echo "PUBSPEC=${PUBSPEC:-not found}"
+            echo "GRADLEW=${GRADLEW:-not found}"
+            echo "SETTINGS=${SETTINGS:-not found}"
+          } | tee build-logs/project-analysis.txt
 
-      - name: Setup Java
-        uses: actions/setup-java@v5
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: ${{ steps.detect.outputs.java_version }}
+          java-version: '17'
           cache: gradle
 
-      - name: Setup Android SDK
+      - name: Set up Android SDK
         uses: android-actions/setup-android@v4
 
-      - name: Setup Flutter
-        if: steps.detect.outputs.flutter == 'true'
+      - name: Set up Flutter
+        if: env.PROJECT_TYPE == 'flutter'
         uses: subosito/flutter-action@v2
         with:
           channel: stable
@@ -153,101 +138,88 @@ jobs:
           pub-cache: true
 
       - name: Prepare Flutter Android host
-        if: steps.detect.outputs.flutter == 'true'
-        working-directory: ${{ steps.detect.outputs.project_dir }}
+        if: env.PROJECT_TYPE == 'flutter'
+        working-directory: ${{ env.PROJECT_DIR }}
         shell: bash
         run: |
           set -Eeuo pipefail
           if [ ! -f gradlew ] && [ ! -f android/gradlew ]; then
-            echo "Android host belum ada. Membuat host Android..."
             flutter create --platforms=android --no-pub .
           fi
 
       - name: Flutter dependencies
-        if: steps.detect.outputs.flutter == 'true'
-        working-directory: ${{ steps.detect.outputs.project_dir }}
+        if: env.PROJECT_TYPE == 'flutter'
+        working-directory: ${{ env.PROJECT_DIR }}
         shell: bash
         run: |
           set -Eeuo pipefail
           flutter pub get 2>&1 | tee "$GITHUB_WORKSPACE/build-logs/flutter-pub-get.log"
 
       - name: Build Flutter APK
-        if: steps.detect.outputs.flutter == 'true'
-        working-directory: ${{ steps.detect.outputs.project_dir }}
+        if: env.PROJECT_TYPE == 'flutter'
+        working-directory: ${{ env.PROJECT_DIR }}
         shell: bash
         run: |
-          set +e
-          TYPE="${{ github.event.inputs.build_type }}"
-          LOG="$GITHUB_WORKSPACE/build-logs/flutter-build.log"
-
-          flutter build apk --"$TYPE" -v 2>&1 | tee "$LOG"
-          RC=${PIPESTATUS[0]}
-
-          if [ "$RC" -ne 0 ] && grep -qiE 'unsupported Gradle project|legacy Android host|Your app is using an unsupported Gradle project' "$LOG"; then
-            echo "Legacy Flutter Android host detected. Regenerating Android host..."
-            rm -rf android
-            flutter create --platforms=android --no-pub .
-            flutter pub get
-            flutter build apk --"$TYPE" -v 2>&1 | tee "$LOG"
-            RC=${PIPESTATUS[0]}
-          fi
-
-          set -e
-          exit "$RC"
+          set -o pipefail
+          TYPE="${{ inputs.build_type }}"
+          flutter build apk --"$TYPE" -v 2>&1 | tee "$GITHUB_WORKSPACE/build-logs/flutter-build.log"
 
       - name: Build Native Android APK
-        if: steps.detect.outputs.flutter != 'true' && steps.detect.outputs.native == 'true'
-        working-directory: ${{ steps.detect.outputs.project_dir }}
+        if: env.PROJECT_TYPE == 'native'
+        working-directory: ${{ env.PROJECT_DIR }}
         shell: bash
         run: |
-          set +e
+          set -o pipefail
           LOG="$GITHUB_WORKSPACE/build-logs/native-build.log"
 
-          if [ ! -f gradlew ]; then
-            echo "ERROR: gradlew tidak ditemukan di project root."
-            echo "Project root: $PWD"
-            find . -maxdepth 3 -type f ( -name gradlew -o -name settings.gradle -o -name settings.gradle.kts ) -print
-            exit 1
+          if [ "${{ inputs.only_analyze }}" = "true" ]; then
+            echo "Analyze-only requested; build skipped." | tee "$LOG"
+            exit 0
           fi
 
-          chmod +x gradlew
-
-          if [ "${{ github.event.inputs.build_type }}" = "debug" ]; then
-            ./gradlew --no-daemon --stacktrace assembleDebug 2>&1 | tee "$LOG"
+          if [ -f gradlew ] && [ -f gradle/wrapper/gradle-wrapper.jar ]; then
+            chmod +x gradlew
+            if [ "${{ inputs.build_type }}" = "debug" ]; then
+              ./gradlew --no-daemon --stacktrace assembleDebug 2>&1 | tee "$LOG"
+            else
+              ./gradlew --no-daemon --stacktrace assembleRelease 2>&1 | tee "$LOG"
+            fi
           else
-            ./gradlew --no-daemon --stacktrace assembleRelease 2>&1 | tee "$LOG"
+            echo "⚠️ Gradle wrapper lengkap tidak tersedia. Menggunakan Gradle 8.4 langsung."
+            GRADLE_VERSION="8.4"
+            curl -fL --retry 3 -o "$RUNNER_TEMP/gradle.zip" \
+              "https://services.gradle.org/distributions/gradle-${GRADLE_VERSION}-bin.zip"
+            rm -rf "$RUNNER_TEMP/gradle"
+            unzip -q "$RUNNER_TEMP/gradle.zip" -d "$RUNNER_TEMP/gradle"
+            GRADLE_BIN="$RUNNER_TEMP/gradle/gradle-${GRADLE_VERSION}/bin/gradle"
+
+            if [ "${{ inputs.build_type }}" = "debug" ]; then
+              "$GRADLE_BIN" --no-daemon --stacktrace assembleDebug 2>&1 | tee "$LOG"
+            else
+              "$GRADLE_BIN" --no-daemon --stacktrace assembleRelease 2>&1 | tee "$LOG"
+            fi
           fi
 
-          RC=${PIPESTATUS[0]}
-          set -e
-          exit "$RC"
-
-      - name: Collect APK and AAB
-        id: output
-        if: always()
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          find "$GITHUB_WORKSPACE/project_raw" -type f             ( -name '*.apk' -o -name '*.aab' )             -not -path '*/.gradle/*'             -exec cp -f {} build-output/ ; || true
-
-          COUNT="$(find build-output -type f ( -name '*.apk' -o -name '*.aab' ) | wc -l | tr -d ' ')"
-          echo "count=$COUNT" >> "$GITHUB_OUTPUT"
-          find build-output -type f -exec ls -lh {} ; || true
-
-      - name: Write diagnostic
+      - name: Collect APK and diagnostics
         if: always()
         shell: bash
         run: |
           set +e
+          find "$GITHUB_WORKSPACE/project_raw" -type f -name '*.apk' \
+            -path '*/build/outputs/apk/*' -exec cp -f {} build-output/ \; 2>/dev/null || true
+
+          find "$GITHUB_WORKSPACE/builds" -type f -name '*.apk' \
+            -path '*/build/outputs/apk/*' -exec cp -f {} build-output/ \; 2>/dev/null || true
+
           {
             echo "===== PROJECT ANALYSIS ====="
             cat build-logs/project-analysis.txt 2>/dev/null || true
             echo
             echo "===== JAVA ====="
-            java -version 2>&1
+            java -version 2>&1 || true
             echo
-            echo "===== OUTPUTS ====="
-            find build-output -type f -exec ls -lh {} ; 2>/dev/null || true
+            echo "===== OUTPUT ====="
+            find build-output -maxdepth 1 -type f -exec ls -lh {} \; 2>/dev/null || true
             echo
             echo "===== BUILD LOG TAIL ====="
             for f in build-logs/*build.log; do
@@ -257,31 +229,44 @@ jobs:
             done
           } > build-logs/final-diagnostic.txt 2>&1
 
-      - name: Upload APK/AAB
-        if: steps.output.outputs.count != '0'
-        uses: actions/upload-artifact@v7
+      - name: Upload APK
+        if: success() && inputs.only_analyze != 'true'
+        uses: actions/upload-artifact@v4
         with:
-          name: android-build-${{ github.event.inputs.tag }}
-          path: build-output/
+          name: android-build-${{ inputs.tag }}
+          path: build-output/*.apk
           if-no-files-found: error
           retention-days: 3
 
       - name: Upload diagnostics
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@v4
         with:
-          name: android-build-logs-${{ github.event.inputs.tag }}
-          path: |
-            build-logs/
-            ${{ github.workspace }}/project_raw/**/build/reports/**
-            ${{ github.workspace }}/project_raw/**/build/outputs/logs/**
+          name: android-build-logs-${{ inputs.tag }}
+          path: build-logs/
           if-no-files-found: warn
           retention-days: 3
 
-      - name: Fail when no APK/AAB was produced
-        if: steps.output.outputs.count == '0'
+      - name: Verify APK
+        if: success() && inputs.only_analyze != 'true'
         shell: bash
         run: |
-          echo "::error::Build selesai tanpa menghasilkan APK/AAB."
-          echo "Diagnostic artifact: android-build-logs-${{ github.event.inputs.tag }}"
-          exit 1
+          APK="$(find build-output -maxdepth 1 -type f -name '*.apk' -print -quit)"
+          if [ -z "$APK" ]; then
+            echo "::error::APK tidak ditemukan."
+            exit 1
+          fi
+          echo "✅ APK: $(basename "$APK")"
+          echo "📦 Size: $(du -h "$APK" | cut -f1)"
+
+      - name: Cleanup user folder
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          if [ -n "${BUILD_DIR:-}" ] && [ -d "$BUILD_DIR" ]; then
+            rm -rf "$BUILD_DIR"
+            echo "🧹 User build folder cleared: builds/${SAFE_USER_ID:-unknown}"
+          fi
+          rm -f project.zip
+          rm -rf project_raw
