@@ -7,6 +7,10 @@ on:
         description: "Project folder inside builds/<user>/<tag>/project"
         required: true
         type: string
+      source_ref:
+        description: "Per-build source branch containing the uploaded project"
+        required: true
+        type: string
       tag:
         description: "Unique build tag"
         required: true
@@ -43,7 +47,10 @@ jobs:
       - name: Checkout user build folder
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.ref }}
+          # Workflow is dispatched from main/default branch so GitHub can
+          # resolve workflow_dispatch. The actual project lives on the
+          # isolated per-build source branch.
+          ref: ${{ inputs.source_ref }}
           fetch-depth: 1
 
       - name: Prepare per-user workspace
