@@ -129,6 +129,7 @@ jobs:
       - name: Flutter version info
         shell: bash
         run: |
+          flutter config --no-analytics 2>/dev/null || true
           flutter --version 2>&1 | tee build-logs/flutter-version.log
           dart --version   2>&1 >> build-logs/flutter-version.log
 
@@ -153,15 +154,44 @@ jobs:
         run: |
           set -o pipefail
 
+          # ── Pastikan pub cache bisa ditulis ──
+          mkdir -p "$HOME/.pub-cache"
+
           echo "📦 Running flutter pub get..."
           flutter pub get 2>&1 | tee build-logs/flutter-pub-get.log
           PUB_EXIT="${PIPESTATUS[0]}"
 
+          # ── Jika gagal, coba upgrade dependency otomatis ──
           if [ "$PUB_EXIT" -ne 0 ]; then
             echo ""
-            echo "::error::flutter pub get gagal (exit $PUB_EXIT)"
+            echo "⚠️  pub get gagal — mencoba flutter pub upgrade..."
+            flutter pub upgrade 2>&1 | tee -a build-logs/flutter-pub-get.log
+            PUB_EXIT="${PIPESTATUS[0]}"
+          fi
+
+          # ── Jika masih gagal, coba downgrade Dart constraint di pubspec ──
+          if [ "$PUB_EXIT" -ne 0 ]; then
+            echo ""
+            echo "⚠️  pub upgrade juga gagal — mencoba relax SDK constraint..."
+            # Backup pubspec
+            cp pubspec.yaml pubspec.yaml.bak
+
+            # Ganti constraint sdk yg terlalu ketat jadi >=3.0.0 <4.0.0
+            sed -i 's/sdk: *"[^"]*"/sdk: ">=3.0.0 <4.0.0"/g' pubspec.yaml
+            sed -i "s/sdk: *'[^']*'/sdk: '>=3.0.0 <4.0.0'/g" pubspec.yaml
+
+            echo "--- pubspec.yaml setelah patch sdk constraint ---"
+            grep -A2 'environment:' pubspec.yaml || true
+
+            flutter pub get 2>&1 | tee -a build-logs/flutter-pub-get.log
+            PUB_EXIT="${PIPESTATUS[0]}"
+          fi
+
+          if [ "$PUB_EXIT" -ne 0 ]; then
+            echo ""
+            echo "::error::flutter pub get gagal (exit $PUB_EXIT) — semua fallback sudah dicoba."
             echo "=== TAIL PUB GET LOG ==="
-            tail -n 50 build-logs/flutter-pub-get.log
+            tail -n 80 build-logs/flutter-pub-get.log
             exit "$PUB_EXIT"
           fi
 
