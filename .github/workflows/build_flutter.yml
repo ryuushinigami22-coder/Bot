@@ -134,22 +134,6 @@ jobs:
           dart --version   2>&1 >> build-logs/flutter-version.log
 
       # ─── 6. CEK pubspec.yaml ────────────────────────────────────────────────
-      - name: Validate pubspec.yaml
-        working-directory: ${{ env.PROJECT_DIR }}
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          echo "=== pubspec.yaml ==="
-          cat pubspec.yaml | tee build-logs/pubspec.log
-
-          # Dump struktur project untuk diagnostik
-          echo "=== Struktur project ==="
-          find . -maxdepth 3 -type f \
-            -not -path './.git/*' \
-            -not -path './.dart_tool/*' \
-            -not -path './build/*' \
-            | sort | head -100
-
       # ─── 7. PASTIKAN ANDROID FOLDER ADA ─────────────────────────────────────
       - name: Ensure android folder exists
         working-directory: ${{ env.PROJECT_DIR }}
