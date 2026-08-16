@@ -289,10 +289,21 @@ jobs:
         run: |
           set +e
 
+          # Cari APK di semua kemungkinan lokasi
+          echo "=== Mencari APK... ==="
+          find "$GITHUB_WORKSPACE" -type f -name '*.apk' 2>/dev/null | head -20 || true
+
           find "$GITHUB_WORKSPACE/project_raw" -type f -name '*.apk' \
-            -path '*/build/outputs/apk/*' -exec cp -f {} build-output/ \; 2>/dev/null || true
+            -exec cp -f {} build-output/ \; 2>/dev/null || true
           find "$GITHUB_WORKSPACE/builds" -type f -name '*.apk' \
-            -path '*/build/outputs/apk/*' -exec cp -f {} build-output/ \; 2>/dev/null || true
+            -exec cp -f {} build-output/ \; 2>/dev/null || true
+          # Fallback: cari di seluruh workspace
+          find "$GITHUB_WORKSPACE" -type f -name '*.apk' \
+            -not -path '*/build-output/*' \
+            -exec cp -f {} build-output/ \; 2>/dev/null || true
+
+          echo "=== APK di build-output ==="
+          ls -lh build-output/ || true
 
           APK="$(find build-output -maxdepth 1 -type f -name '*.apk' -print -quit)"
           if [ -n "$APK" ]; then
@@ -374,13 +385,23 @@ jobs:
 
       # ─── 14. VERIFY ──────────────────────────────────────────────────────────
       - name: Verify APK
-        if: success()
+        if: always()
         shell: bash
         run: |
-          APK="$(find build-output -maxdepth 1 -type f -name '*.apk' -print -quit)"
+          APK="$(find build-output -maxdepth 1 -type f -name '*.apk' -print -quit 2>/dev/null || true)"
           if [ -z "$APK" ]; then
-            echo "::error::APK tidak ditemukan setelah build."
-            exit 1
+            echo "⚠️  APK tidak ada di build-output, coba cari di workspace..."
+            APK="$(find "$GITHUB_WORKSPACE" -type f -name '*.apk' -print -quit 2>/dev/null || true)"
+            if [ -n "$APK" ]; then
+              echo "✅ APK ketemu di: $APK"
+              cp -f "$APK" build-output/
+              APK="build-output/$(basename "$APK")"
+            else
+              echo "::error::APK tidak ditemukan di mana pun. Build mungkin gagal."
+              echo "=== Semua file di workspace ==="
+              find "$GITHUB_WORKSPACE" -name '*.apk' 2>/dev/null || echo "Tidak ada APK"
+              exit 1
+            fi
           fi
           echo "✅ APK: $(basename "$APK")"
           echo "📦 Size: $(du -h "$APK" | cut -f1)"
