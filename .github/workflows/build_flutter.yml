@@ -254,20 +254,29 @@ jobs:
         run: |
           set -o pipefail
           TYPE="${{ inputs.build_type }}"
+          LOG="$GITHUB_WORKSPACE/build-logs/flutter-build.log"
+          mkdir -p "$GITHUB_WORKSPACE/build-logs"
+
           echo "🔨 Building: flutter build apk --${TYPE}"
+          echo "📁 PROJECT_DIR: $PWD"
+          echo "📋 pubspec.yaml content:"
+          cat pubspec.yaml | head -20
 
-          flutter build apk --"$TYPE" \
-            --verbose \
-            --no-shrink \
-            2>&1 | tee "$GITHUB_WORKSPACE/build-logs/flutter-build.log"
+          # Run build dengan output langsung ke file DAN stdout
+          flutter build apk --"$TYPE"             --verbose             --no-shrink             2>&1 | tee "$LOG" ; BUILD_EXIT="${PIPESTATUS[0]}"
 
-          BUILD_EXIT="${PIPESTATUS[0]}"
+          echo ""
+          echo "=== BUILD EXIT CODE: $BUILD_EXIT ==="
+
           if [ "$BUILD_EXIT" -ne 0 ]; then
             echo ""
             echo "::error::Flutter build gagal (exit $BUILD_EXIT)"
             echo ""
-            echo "=== TAIL ERROR LOG ==="
-            tail -n 100 "$GITHUB_WORKSPACE/build-logs/flutter-build.log"
+            echo "=== TAIL BUILD LOG (last 150 lines) ==="
+            tail -n 150 "$LOG" || true
+            echo ""
+            echo "=== GRADLE ERRORS ==="
+            grep -i "error\|exception\|failed\|FAILED" "$LOG" | tail -n 50 || true
             exit "$BUILD_EXIT"
           fi
 
@@ -345,12 +354,12 @@ jobs:
 
       # ─── 12. UPLOAD APK ──────────────────────────────────────────────────────
       - name: Upload APK
-        if: success()
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: flutter-build-${{ inputs.tag }}
           path: build-output/*.apk
-          if-no-files-found: error
+          if-no-files-found: warn
           retention-days: 3
 
       # ─── 13. UPLOAD LOGS ─────────────────────────────────────────────────────
