@@ -145,7 +145,7 @@ jobs:
               # Dart 3.5.x → Flutter 3.24.x
               # Dart 3.4.x → Flutter 3.22.x
               case "$DART_MINOR" in
-                8|9|10) FLUTTER_VER="3.32.0" ;;
+                8|9|10) FLUTTER_VER="3.32.2" ;;
                 7)      FLUTTER_VER="3.29.0" ;;
                 6)      FLUTTER_VER="3.27.0" ;;
                 5)      FLUTTER_VER="3.24.0" ;;
@@ -199,16 +199,17 @@ jobs:
         run: |
           set -o pipefail
           mkdir -p "$HOME/.pub-cache"
+          mkdir -p "$GITHUB_WORKSPACE/build-logs"
 
           echo "📦 Running flutter pub get..."
-          flutter pub get 2>&1 | tee build-logs/flutter-pub-get.log
+          flutter pub get 2>&1 | tee "$GITHUB_WORKSPACE/build-logs/flutter-pub-get.log"
           PUB_EXIT="${PIPESTATUS[0]}"
 
           # Fallback 1: pub upgrade
           if [ "$PUB_EXIT" -ne 0 ]; then
             echo ""
             echo "⚠️  pub get gagal — mencoba flutter pub upgrade..."
-            flutter pub upgrade 2>&1 | tee -a build-logs/flutter-pub-get.log
+            flutter pub upgrade 2>&1 | tee -a "$GITHUB_WORKSPACE/build-logs/flutter-pub-get.log"
             PUB_EXIT="${PIPESTATUS[0]}"
           fi
 
@@ -221,7 +222,7 @@ jobs:
             sed -i "s/sdk: *'[^']*'/sdk: '>=3.0.0 <4.0.0'/g" pubspec.yaml
             echo "--- pubspec.yaml setelah patch ---"
             grep -A2 'environment:' pubspec.yaml || true
-            flutter pub get 2>&1 | tee -a build-logs/flutter-pub-get.log
+            flutter pub get 2>&1 | tee -a "$GITHUB_WORKSPACE/build-logs/flutter-pub-get.log"
             PUB_EXIT="${PIPESTATUS[0]}"
           fi
 
@@ -231,7 +232,8 @@ jobs:
             echo "=== pubspec.yaml ==="
             cat pubspec.yaml
             echo "=== TAIL PUB GET LOG ==="
-            tail -n 80 build-logs/flutter-pub-get.log
+            tail -n 80 "$GITHUB_WORKSPACE/build-logs/flutter-pub-get.log"
+            echo "=== TAIL PUB GET LOG ==="
             exit "$PUB_EXIT"
           fi
 
