@@ -78,12 +78,11 @@ jobs:
           mkdir -p "$USER_BUILD_DIR"
           cp -a project_raw/. "$USER_BUILD_DIR/"
 
-          # Cari pubspec.yaml = root Flutter project
+          # Cari pubspec.yaml paling shallow (level direktori paling sedikit)
           PUBSPEC="$(find "$USER_BUILD_DIR" -type f -name pubspec.yaml \
             -not -path '*/.dart_tool/*' \
             -not -path '*/.git/*' \
-            -not -path '*/build/*' \
-            -print -quit || true)"
+            | awk '{ print gsub(/\//,"/"), $0 }' | sort -n | head -1 | cut -d' ' -f2- || true)"
 
           if [ -z "$PUBSPEC" ]; then
             echo "::error::pubspec.yaml tidak ditemukan — ini bukan project Flutter."
@@ -153,8 +152,20 @@ jobs:
         shell: bash
         run: |
           set -o pipefail
-          flutter pub get --verbose 2>&1 | tee build-logs/flutter-pub-get.log
-          echo "Exit code: $?"
+
+          echo "📦 Running flutter pub get..."
+          flutter pub get 2>&1 | tee build-logs/flutter-pub-get.log
+          PUB_EXIT="${PIPESTATUS[0]}"
+
+          if [ "$PUB_EXIT" -ne 0 ]; then
+            echo ""
+            echo "::error::flutter pub get gagal (exit $PUB_EXIT)"
+            echo "=== TAIL PUB GET LOG ==="
+            tail -n 50 build-logs/flutter-pub-get.log
+            exit "$PUB_EXIT"
+          fi
+
+          echo "✅ pub get selesai!"
 
       # ─── 9. ANALYZE (opsional, untuk diagnostik) ─────────────────────────────
       - name: Flutter analyze
