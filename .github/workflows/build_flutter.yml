@@ -26,7 +26,7 @@ on:
         required: false
         default: "false"
       flutter_version:
-        description: "Flutter version (kosongkan = stable terbaru)"
+        description: "Flutter version (kosongkan = auto-detect dari pubspec)"
         required: false
         default: ""
 
@@ -78,7 +78,6 @@ jobs:
           mkdir -p "$USER_BUILD_DIR"
           cp -a project_raw/. "$USER_BUILD_DIR/"
 
-          # Cari pubspec.yaml paling shallow (level direktori paling sedikit)
           PUBSPEC="$(find "$USER_BUILD_DIR" -type f -name pubspec.yaml \
             -not -path '*/.dart_tool/*' \
             -not -path '*/.git/*' \
@@ -96,6 +95,7 @@ jobs:
           echo "BUILD_DIR=$USER_BUILD_DIR"   >> "$GITHUB_ENV"
           echo "PROJECT_DIR=$PROJECT_DIR"    >> "$GITHUB_ENV"
           echo "SAFE_USER_ID=$SAFE_USER_ID"  >> "$GITHUB_ENV"
+          echo "PUBSPEC_PATH=$PUBSPEC"       >> "$GITHUB_ENV"
 
           {
             echo "PROJECT_TYPE=flutter"
@@ -117,11 +117,57 @@ jobs:
       - name: Set up Android SDK
         uses: android-actions/setup-android@v4
 
-      # ─── 5. FLUTTER ─────────────────────────────────────────────────────────
+      # ─── 5. DETECT FLUTTER VERSION ──────────────────────────────────────────
+      - name: Detect required Flutter version from pubspec
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          FLUTTER_VER="${{ inputs.flutter_version }}"
+
+          if [ -z "$FLUTTER_VER" ] && [ -n "${PUBSPEC_PATH:-}" ] && [ -f "$PUBSPEC_PATH" ]; then
+            # Baca sdk constraint dari pubspec.yaml
+            SDK_LINE="$(grep 'sdk:' "$PUBSPEC_PATH" | grep -v 'flutter' | head -1 || true)"
+            echo "📋 SDK line: $SDK_LINE"
+
+            # Ambil angka versi minimum
+            MIN_DART="$(echo "$SDK_LINE" | grep -oP '\d+\.\d+\.\d+' | head -1 || true)"
+            echo "🎯 Min Dart required: ${MIN_DART:-tidak ditemukan}"
+
+            if [ -n "$MIN_DART" ]; then
+              DART_MINOR="$(echo "$MIN_DART" | cut -d. -f2)"
+              DART_PATCH="$(echo "$MIN_DART" | cut -d. -f3)"
+
+              # Map Dart → Flutter version
+              # Dart 3.8.x → Flutter 3.32.x (bundled Dart 3.8.1)
+              # Dart 3.7.x → Flutter 3.29.x
+              # Dart 3.6.x → Flutter 3.27.x
+              # Dart 3.5.x → Flutter 3.24.x
+              # Dart 3.4.x → Flutter 3.22.x
+              case "$DART_MINOR" in
+                8|9|10) FLUTTER_VER="3.32.0" ;;
+                7)      FLUTTER_VER="3.29.0" ;;
+                6)      FLUTTER_VER="3.27.0" ;;
+                5)      FLUTTER_VER="3.24.0" ;;
+                4)      FLUTTER_VER="3.22.0" ;;
+                *)      FLUTTER_VER="" ;;
+              esac
+
+              echo "✅ Flutter version dipilih otomatis: ${FLUTTER_VER:-stable terbaru}"
+            else
+              echo "ℹ️  Tidak bisa baca dart version, pakai stable terbaru"
+            fi
+          else
+            echo "ℹ️  flutter_version dari input: ${FLUTTER_VER:-kosong, pakai stable}"
+          fi
+
+          echo "FLUTTER_RESOLVED_VERSION=${FLUTTER_VER}" >> "$GITHUB_ENV"
+
+      # ─── 6. FLUTTER ─────────────────────────────────────────────────────────
       - name: Set up Flutter
         uses: subosito/flutter-action@v2
         with:
-          flutter-version: ${{ inputs.flutter_version }}
+          flutter-version: ${{ env.FLUTTER_RESOLVED_VERSION }}
           channel: stable
           cache: true
           pub-cache: true
@@ -133,7 +179,6 @@ jobs:
           flutter --version 2>&1 | tee build-logs/flutter-version.log
           dart --version   2>&1 >> build-logs/flutter-version.log
 
-      # ─── 6. CEK pubspec.yaml ────────────────────────────────────────────────
       # ─── 7. PASTIKAN ANDROID FOLDER ADA ─────────────────────────────────────
       - name: Ensure android folder exists
         working-directory: ${{ env.PROJECT_DIR }}
@@ -153,15 +198,13 @@ jobs:
         shell: bash
         run: |
           set -o pipefail
-
-          # ── Pastikan pub cache bisa ditulis ──
           mkdir -p "$HOME/.pub-cache"
 
           echo "📦 Running flutter pub get..."
           flutter pub get 2>&1 | tee build-logs/flutter-pub-get.log
           PUB_EXIT="${PIPESTATUS[0]}"
 
-          # ── Jika gagal, coba upgrade dependency otomatis ──
+          # Fallback 1: pub upgrade
           if [ "$PUB_EXIT" -ne 0 ]; then
             echo ""
             echo "⚠️  pub get gagal — mencoba flutter pub upgrade..."
@@ -169,20 +212,15 @@ jobs:
             PUB_EXIT="${PIPESTATUS[0]}"
           fi
 
-          # ── Jika masih gagal, coba downgrade Dart constraint di pubspec ──
+          # Fallback 2: relax SDK constraint
           if [ "$PUB_EXIT" -ne 0 ]; then
             echo ""
             echo "⚠️  pub upgrade juga gagal — mencoba relax SDK constraint..."
-            # Backup pubspec
             cp pubspec.yaml pubspec.yaml.bak
-
-            # Ganti constraint sdk yg terlalu ketat jadi >=3.0.0 <4.0.0
             sed -i 's/sdk: *"[^"]*"/sdk: ">=3.0.0 <4.0.0"/g' pubspec.yaml
             sed -i "s/sdk: *'[^']*'/sdk: '>=3.0.0 <4.0.0'/g" pubspec.yaml
-
-            echo "--- pubspec.yaml setelah patch sdk constraint ---"
+            echo "--- pubspec.yaml setelah patch ---"
             grep -A2 'environment:' pubspec.yaml || true
-
             flutter pub get 2>&1 | tee -a build-logs/flutter-pub-get.log
             PUB_EXIT="${PIPESTATUS[0]}"
           fi
@@ -190,6 +228,8 @@ jobs:
           if [ "$PUB_EXIT" -ne 0 ]; then
             echo ""
             echo "::error::flutter pub get gagal (exit $PUB_EXIT) — semua fallback sudah dicoba."
+            echo "=== pubspec.yaml ==="
+            cat pubspec.yaml
             echo "=== TAIL PUB GET LOG ==="
             tail -n 80 build-logs/flutter-pub-get.log
             exit "$PUB_EXIT"
@@ -197,7 +237,7 @@ jobs:
 
           echo "✅ pub get selesai!"
 
-      # ─── 9. ANALYZE (opsional, untuk diagnostik) ─────────────────────────────
+      # ─── 9. ANALYZE ──────────────────────────────────────────────────────────
       - name: Flutter analyze
         working-directory: ${{ env.PROJECT_DIR }}
         shell: bash
@@ -238,13 +278,11 @@ jobs:
         run: |
           set +e
 
-          # Salin semua APK ke build-output
           find "$GITHUB_WORKSPACE/project_raw" -type f -name '*.apk' \
             -path '*/build/outputs/apk/*' -exec cp -f {} build-output/ \; 2>/dev/null || true
           find "$GITHUB_WORKSPACE/builds" -type f -name '*.apk' \
             -path '*/build/outputs/apk/*' -exec cp -f {} build-output/ \; 2>/dev/null || true
 
-          # Rename APK pakai label aplikasi
           APK="$(find build-output -maxdepth 1 -type f -name '*.apk' -print -quit)"
           if [ -n "$APK" ]; then
             AAPT=""
@@ -282,7 +320,6 @@ jobs:
             echo "📦 Size: $(du -h "$TARGET" | cut -f1)"
           fi
 
-          # Final diagnostic log
           {
             echo "===== PROJECT ANALYSIS ====="
             cat build-logs/project-analysis.txt 2>/dev/null || true
