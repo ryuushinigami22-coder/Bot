@@ -21,6 +21,10 @@ on:
         description: "Telegram user ID"
         required: false
         default: "unknown"
+      only_analyze:
+        description: "Analyze only (skip build)"
+        required: false
+        default: "false"
       flutter_version:
         description: "Flutter version (kosongkan = stable terbaru)"
         required: false
